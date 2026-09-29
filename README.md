@@ -504,5 +504,3 @@ python -m unittest discover -s tests -v
 8. **Cloudflare Tunnel 文档**：[Tunnel 概述](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/)、[远程管理隧道](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/get-started/create-remote-tunnel/)。公网连接与路由配置的依据。
 9. **Cloudflare cloudflared**：[官方仓库](https://github.com/cloudflare/cloudflared)、[发行版](https://github.com/cloudflare/cloudflared/releases)。隧道客户端来源。
 10. **Genymobile scrcpy**：[官方仓库](https://github.com/Genymobile/scrcpy)、[屏幕控制说明](https://github.com/Genymobile/scrcpy/blob/master/doc/device.md)。可选投屏和熄屏操作的参考。
-
-发布前建议补全 DroidDesk 应用版本和手机系统版本。请只发布这个独立教程目录，不要把实际部署目录、密钥、日志或私人截图一起上传。
