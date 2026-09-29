@@ -1,0 +1,288 @@
+#!/usr/bin/python3
+"""Manage this phone's dedicated SubBoost installation."""
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from urllib.parse import urlsplit
+
+REPO = Path('/opt/subboost')
+STATE = Path('/opt/subboost-data')
+PGDATA = STATE / 'postgres'
+SOCKET = STATE / 'run'
+LOGS = STATE / 'logs'
+NODE = '/opt/subboost-tools/node/bin/node'
+PG = '/usr/lib/postgresql/17/bin'
+ENVFILE = REPO / 'local/.env'
+MANAGER = '/opt/subboost-tools/subboost'
+CLOUDFLARED = '/opt/subboost-tools/cloudflared'
+os.environ['PATH'] = '/opt/subboost-tools/node/bin:/usr/local/bin:/usr/bin:/bin'
+
+
+def command(args, **kwargs):
+    return subprocess.run(args, check=True, **kwargs)
+
+
+def settings():
+    result = {}
+    for line in ENVFILE.read_text().splitlines():
+        if line.strip() and not line.startswith('#'):
+            key, value = line.split('=', 1)
+            result[key] = value
+    return result
+
+
+def prepare_paths():
+    for path in (STATE, SOCKET, LOGS):
+        path.mkdir(parents=True, exist_ok=True)
+        path.chmod(0o700)
+
+
+def db_start():
+    prepare_paths()
+    if not (PGDATA / 'global/pg_control').is_file():
+        raise RuntimeError('Database is not initialized. Run subboost prepare first.')
+    status = subprocess.run([PG + '/pg_ctl', '-D', str(PGDATA), 'status'],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if status.returncode:
+        command([PG + '/pg_ctl', '-D', str(PGDATA), '-l', str(LOGS / 'postgres.log'),
+                 '-w', 'start'])
+
+
+def prepare():
+    if os.getuid() == 0:
+        raise RuntimeError('Start the Debian session as the subboost user, not root.')
+    prepare_paths()
+    if not ENVFILE.exists():
+        password = secrets.token_hex(32)
+        values = {
+            'POSTGRES_DB': 'subboost', 'POSTGRES_USER': 'subboost',
+            'POSTGRES_PASSWORD': password,
+            'DATABASE_URL': f'postgresql://subboost:{password}@127.0.0.1:5433/subboost?schema=public',
+            **{name: secrets.token_hex(32) for name in
+               ('ENCRYPTION_KEY', 'JWT_SECRET', 'CRON_SECRET', 'LOCAL_SETUP_TOKEN')},
+            'ALLOW_UNAUTHENTICATED_CRON': 'false', 'TRUST_PROXY_HEADERS': 'false',
+            'APP_URL': 'http://127.0.0.1:3000', 'SUBBOOST_PORT': '3000',
+        }
+        descriptor = os.open(ENVFILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, 'w') as handle:
+            handle.write(''.join(f'{key}={value}\n' for key, value in values.items()))
+    if PGDATA.exists() and not (PGDATA / 'global/pg_control').exists():
+        config = PGDATA / 'postgresql.conf'
+        if config.exists() and config.stat().st_size == 0:
+            preserved = STATE / ('postgres-incomplete-' + time.strftime('%Y%m%d-%H%M%S'))
+            PGDATA.rename(preserved)
+            print('Preserved incomplete database initialization at ' + str(preserved), flush=True)
+        else:
+            raise RuntimeError('Unrecognized incomplete database directory; inspect it before retrying.')
+    if not (PGDATA / 'global/pg_control').exists():
+        command([PG + '/initdb', '-D', str(PGDATA), '-U', 'subboost_admin',
+                 '--auth-local=trust', '--auth-host=scram-sha-256',
+                 '--encoding=UTF8', '--locale=C.UTF-8',
+                 '-c', 'shared_memory_type=mmap', '-c', 'dynamic_shared_memory_type=mmap',
+                 '-c', 'huge_pages=off', '-c', 'shared_buffers=32MB',
+                 '-c', 'max_connections=20', '-c', 'max_parallel_workers=0',
+                 '-c', 'listen_addresses=127.0.0.1', '-c', 'port=5433',
+                 '-c', f'unix_socket_directories={SOCKET}'])
+    db_start()
+    values = settings()
+    password = values['POSTGRES_PASSWORD']
+    if not re.fullmatch('[0-9a-f]{64}', password):
+        raise RuntimeError('Existing database password needs manual handling; it was not changed.')
+    sql = (
+        "SELECT 'CREATE ROLE subboost LOGIN PASSWORD ''" + password +
+        "''' WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname='subboost')\\gexec\n"
+        "SELECT 'CREATE DATABASE subboost OWNER subboost' "
+        "WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname='subboost')\\gexec\n"
+    )
+    result = subprocess.run([PG + '/psql', '-X', '-h', str(SOCKET), '-p', '5433',
+                             '-U', 'subboost_admin', '-d', 'postgres', '-v', 'ON_ERROR_STOP=1'],
+                            input=sql, text=True, capture_output=True)
+    if result.returncode:
+        raise RuntimeError(result.stderr.replace(password, '[redacted]'))
+    print('Database and private environment configuration are ready.')
+
+
+def process_pid(name):
+    path = STATE / f'{name}.pid'
+    if not path.exists():
+        return None
+    try:
+        pid = int(path.read_text().strip())
+        args = Path(f'/proc/{pid}/cmdline').read_bytes().split(b'\0')
+        expected = {'app': str(REPO / 'local/scripts/start-standalone.cjs'),
+                    'cron': MANAGER, 'tunnel': CLOUDFLARED}[name].encode()
+        marker = ('SUBBOOST_MANAGED_PROCESS=' + name).encode()
+        environment = Path(f'/proc/{pid}/environ').read_bytes().split(b'\0')
+        if expected in args or marker in environment:
+            return pid
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def health():
+    with urllib.request.urlopen('http://127.0.0.1:3000/api/health/ready', timeout=5) as response:
+        value = json.load(response)
+        return response.status == 200 and value.get('ok') is True
+
+
+def start():
+    db_start()
+    env = os.environ | settings() | {
+        'NODE_ENV': 'production', 'HOSTNAME': '127.0.0.1', 'PORT': '3000',
+        'NEXT_TELEMETRY_DISABLED': '1',
+        'SUBBOOST_MANAGED_PROCESS': 'app',
+    }
+    if not process_pid('app'):
+        with (LOGS / 'app.log').open('ab') as log:
+            process = subprocess.Popen([NODE, str(REPO / 'local/scripts/start-standalone.cjs')],
+                                       cwd=REPO / 'local', env=env, stdin=subprocess.DEVNULL,
+                                       stdout=log, stderr=log, start_new_session=True)
+        (STATE / 'app.pid').write_text(str(process.pid))
+    for _ in range(60):
+        try:
+            if health():
+                break
+        except (OSError, ValueError):
+            pass
+        time.sleep(2)
+    else:
+        raise RuntimeError('App did not become ready. Check /opt/subboost-data/logs/app.log.')
+    if not process_pid('cron'):
+        with (LOGS / 'cron.log').open('ab') as log:
+            process = subprocess.Popen(['/usr/bin/python3', MANAGER, 'cron'],
+                                       env=env | {'SUBBOOST_MANAGED_PROCESS': 'cron'},
+                                       stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                       start_new_session=True)
+        (STATE / 'cron.pid').write_text(str(process.pid))
+    print('Local health check passed. Configured URL: ' + settings()['APP_URL'])
+    if (STATE / 'tunnel-enabled').exists():
+        tunnel_start()
+
+
+def tunnel_start():
+    prepare_paths()
+    token = STATE / 'tunnel-token'
+    if not token.is_file():
+        raise RuntimeError('Tunnel credential file is missing.')
+    token.chmod(0o600)
+    if process_pid('tunnel'):
+        print('Tunnel client is already running.')
+        return
+    with (LOGS / 'tunnel.log').open('ab') as log:
+        process = subprocess.Popen(
+            [CLOUDFLARED, 'tunnel', '--no-autoupdate', '--protocol', 'http2',
+             '--metrics', '127.0.0.1:20241', 'run', '--token-file', str(token)],
+            env=os.environ | {'SUBBOOST_MANAGED_PROCESS': 'tunnel'},
+            stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+    (STATE / 'tunnel.pid').write_text(str(process.pid))
+    time.sleep(2)
+    if process.poll() is not None:
+        raise RuntimeError('Tunnel client exited; inspect the tunnel log.')
+    print('Tunnel client started; connection readiness still needs verification.')
+
+
+def public_url():
+    if len(sys.argv) != 3:
+        raise RuntimeError('Usage: subboost public-url https://subboost.example.com')
+    url = sys.argv[2]
+    parsed = urlsplit(url)
+    if (parsed.scheme != 'https' or not parsed.hostname or parsed.username
+            or parsed.password or parsed.query or parsed.fragment
+            or parsed.path not in ('', '/') or any(c.isspace() for c in url)):
+        raise RuntimeError('Provide an HTTPS origin without credentials, path, or whitespace.')
+    values = settings()
+    values['APP_URL'] = url.rstrip('/')
+    temporary = ENVFILE.with_suffix('.env.new')
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, 'w') as handle:
+        handle.write(''.join(f'{key}={value}\n' for key, value in values.items()))
+    temporary.replace(ENVFILE)
+    print('Public application URL configured; restart the app to apply it.')
+
+
+def cron():
+    index = 0
+    token = settings()['CRON_SECRET']
+    while True:
+        endpoints = ['update-subscriptions']
+        if index % 10 == 0:
+            endpoints.insert(0, 'update-rule-index')
+        for endpoint in endpoints:
+            request = urllib.request.Request(
+                'http://127.0.0.1:3000/api/cron/' + endpoint, data=b'', method='POST',
+                headers={'Authorization': 'Bearer ' + token})
+            try:
+                with urllib.request.urlopen(request, timeout=300) as response:
+                    print(time.strftime('%Y-%m-%d %H:%M:%S'), endpoint, response.status, flush=True)
+            except (OSError, ValueError) as error:
+                print(time.strftime('%Y-%m-%d %H:%M:%S'), endpoint, type(error).__name__, flush=True)
+        index += 1
+        time.sleep(360)
+
+
+def stop():
+    for name in ('tunnel', 'cron', 'app'):
+        pid = process_pid(name)
+        if pid:
+            os.killpg(pid, signal.SIGTERM)
+    # Wait for managed services before stopping their database.
+    deadline = time.monotonic() + 15
+    while any(process_pid(name) for name in ('tunnel', 'cron', 'app')):
+        if time.monotonic() >= deadline:
+            raise RuntimeError('Services are still stopping; inspect them before stopping PostgreSQL.')
+        time.sleep(0.5)
+    status = subprocess.run([PG + '/pg_ctl', '-D', str(PGDATA), 'status'],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if status.returncode == 0:
+        command([PG + '/pg_ctl', '-D', str(PGDATA), '-m', 'fast', '-w', 'stop'])
+
+
+def main():
+    action = sys.argv[1] if len(sys.argv) > 1 else 'status'
+    if action == 'prepare':
+        prepare()
+    elif action == 'start':
+        start()
+    elif action == 'stop':
+        stop()
+    elif action == 'cron':
+        cron()
+    elif action == 'tunnel-start':
+        tunnel_start()
+    elif action == 'public-url':
+        public_url()
+    elif action == 'enable':
+        prepare_paths()
+        (STATE / 'enabled').touch(mode=0o600)
+        if (STATE / 'tunnel-token').is_file():
+            (STATE / 'tunnel-enabled').touch(mode=0o600)
+        print('SubBoost and its tunnel will start when the phone launcher is run.')
+    elif action == 'setup-url':
+        values = settings()
+        print(values['APP_URL'].rstrip('/') + '/login#setup-token=' + values['LOCAL_SETUP_TOKEN'])
+    elif action == 'status':
+        print('app:', process_pid('app'), 'cron:', process_pid('cron'),
+              'tunnel:', process_pid('tunnel'))
+        try:
+            print('ready:', health())
+        except (OSError, ValueError):
+            print('ready: False')
+    else:
+        raise RuntimeError('Usage: subboost {prepare|start|stop|status|setup-url|public-url URL|tunnel-start|enable}')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (RuntimeError, subprocess.CalledProcessError) as error:
+        print(str(error), file=sys.stderr)
+        sys.exit(1)
