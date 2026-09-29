@@ -55,7 +55,7 @@ SubBoost 当前使用 **AGPL-3.0-only**。若修改 SubBoost 并通过网络向�
 
 | 项目 | 本次部署 |
 | --- | --- |
-| 手机 | 荣耀 20S，6 GB 内存，ARM64 |
+| 手机 | 荣耀 20S，8 GB 内存，ARM64 |
 | Android Root / Bootloader 解锁 | 均不需要 |
 | 安卓应用环境 | 已安装 DroidDesk，可进入其原生终端 |
 | 最终 Linux 用户空间 | Debian 13，运行在 PRoot 内 |
