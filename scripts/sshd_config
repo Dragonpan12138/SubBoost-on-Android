@@ -1,0 +1,16 @@
+Port 8023
+ListenAddress 0.0.0.0
+HostKey /opt/subboost-data/ssh/host_ed25519
+PidFile /opt/subboost-data/ssh/sshd.pid
+AuthorizedKeysFile /opt/subboost-data/ssh/authorized_keys
+AllowUsers subboost
+PermitRootLogin no
+AuthenticationMethods publickey
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+UsePAM no
+StrictModes no
+PrintMotd no
+PrintLastLog no
+Subsystem sftp internal-sftp
